@@ -69,7 +69,7 @@ while [[ -z "$EMAIL" ]]; do
 done
 
 # Generar contraseña segura para PostgreSQL
-DB_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
+POSTGRES_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
 
 # Configuración
 N8N_DIR="$REAL_HOME/n8n"
@@ -566,7 +566,7 @@ echo ""
 
 # Mostrar contraseña de la base de datos
 print_warning "IMPORTANTE: Guarda esta contraseña de PostgreSQL:"
-echo -e "${YELLOW}${DB_PASSWORD}${NC}"
+echo -e "${YELLOW}${POSTGRES_PASSWORD}${NC}"
 echo ""
 echo "También está guardada en: ${N8N_DIR}/.env"
 echo ""
