@@ -1,6 +1,5 @@
-version: '3.8'
-
 services:
+  # Base de datos PostgreSQL (para n8n)
   postgres:
     image: postgres:15-alpine
     container_name: n8n-postgres
@@ -12,7 +11,7 @@ services:
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U n8n']
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER}']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -20,6 +19,63 @@ services:
     networks:
       - n8n-network
 
+  # Redis para caché (opcional, pero útil)
+  redis:
+    image: redis:7-alpine
+    container_name: n8n-redis
+    restart: unless-stopped
+    volumes:
+      - ./redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - n8n-network
+
+  # MySQL para flujos de n8n
+  mysql:
+    image: mysql:8.0
+    container_name: n8n-mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost', '-u', 'root', '-p${MYSQL_ROOT_PASSWORD}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - n8n-network
+
+  # phpMyAdmin - Solo acceso local
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: n8n-phpmyadmin
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    environment:
+      - PMA_HOST=mysql
+      - PMA_PORT=3306
+      - UPLOAD_LIMIT=100M
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - n8n-network
+
+  # n8n principal
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
@@ -27,33 +83,62 @@ services:
     ports:
       - "127.0.0.1:5678:5678"
     environment:
+      # Database
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=postgres
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
       - DB_POSTGRESDB_USER=${POSTGRES_USER}
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+
+      # General
       - N8N_PROTOCOL=https
       - N8N_HOST=${DOMAIN}
       - WEBHOOK_URL=https://${DOMAIN}/
       - GENERIC_TIMEZONE=${TIMEZONE}
       - N8N_METRICS=true
       - N8N_LOG_LEVEL=info
+      - N8N_PROXY_HOPS=1
+
+      # Executions
       - EXECUTIONS_DATA_SAVE_ON_ERROR=all
       - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
       - EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS=true
+
+      # Task Runners - MODO EXTERNO
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_RUNNERS_MODE=external
+      - N8N_RUNNERS_AUTH_TOKEN=${N8N_RUNNERS_AUTH_TOKEN}
+      - N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0
+      - N8N_RUNNERS_SERVER_LISTEN_ADDRESS=0.0.0.0
+      - RUNNERS_SERVER_LISTEN_ADDRESS=0.0.0.0
+
     volumes:
       - ./n8n-data:/home/node/.n8n
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    networks:
+      - n8n-network
+
+  # Task Runner (JavaScript y Python)
+  n8n-runner:
+    image: n8nio/runners:latest
+    container_name: n8n-runner
+    restart: unless-stopped
+    environment:
+      - N8N_RUNNERS_TASK_BROKER_URI=http://n8n:5679
+      - N8N_RUNNERS_AUTH_TOKEN=${N8N_RUNNERS_AUTH_TOKEN}
+      - N8N_RUNNERS_MAX_CONCURRENCY=5
+    depends_on:
+      - n8n
     networks:
       - n8n-network
 
 networks:
   n8n-network:
     driver: bridge
-
-volumes:
-  postgres-data:
-  n8n-data:
