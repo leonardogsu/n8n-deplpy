@@ -1,0 +1,506 @@
+#!/bin/bash
+
+#############################################
+# Restore de n8n - Completo y Migración
+#############################################
+
+# Colores
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Rutas (inyectadas por install-n8n.sh)
+N8N_DIR="__N8N_DIR__"
+BACKUP_DIR="__BACKUP_DIR__"
+POSTGRES_USER="__POSTGRES_USER__"
+POSTGRES_DB="__POSTGRES_DB__"
+MYSQL_ROOT_PASSWORD="__MYSQL_ROOT_PASSWORD__"
+
+# Funciones
+log_ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
+log_err()  { echo -e "${RED}[✗]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+log_info() { echo -e "${BLUE}[i]${NC} $1"; }
+
+show_help() {
+    echo ""
+    echo "Uso: ./restore.sh [MODO] [OPCIONES] <archivo_backup.tar.gz>"
+    echo ""
+    echo "Modos:"
+    echo "  --full          Restaurar todo: BD + archivos (por defecto)"
+    echo "  --migrate       Todo + encryption key + reimportar credenciales"
+    echo "  --db-only       Solo restaurar bases de datos"
+    echo "  --files-only    Solo restaurar archivos de n8n (n8n-data)"
+    echo "  --workflows     Solo importar workflows desde JSON"
+    echo "  --credentials   Solo importar credenciales desde JSON"
+    echo ""
+    echo "Opciones:"
+    echo "  --no-mysql      Omitir restauración de MySQL"
+    echo "  --no-safety     Omitir backup de seguridad previo"
+    echo "  --list          Listar backups disponibles"
+    echo "  --inspect       Ver contenido del backup sin restaurar"
+    echo "  -h, --help      Mostrar esta ayuda"
+    echo ""
+    echo "Ejemplos:"
+    echo "  ./restore.sh n8n_full_20250305.tar.gz"
+    echo "  ./restore.sh --migrate n8n_migrate_20250305.tar.gz"
+    echo "  ./restore.sh --workflows n8n_migrate_20250305.tar.gz"
+    echo "  ./restore.sh --db-only --no-mysql n8n_full_20250305.tar.gz"
+    echo "  ./restore.sh --inspect n8n_full_20250305.tar.gz"
+    echo "  ./restore.sh --list"
+    echo ""
+}
+
+# Defaults
+MODE="full"
+SKIP_MYSQL=false
+SAFETY_BACKUP=true
+BACKUP_FILE=""
+INSPECT_ONLY=false
+
+# Parsear argumentos
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --full)          MODE="full"; shift ;;
+        --migrate)       MODE="migrate"; shift ;;
+        --db-only)       MODE="db-only"; shift ;;
+        --files-only)    MODE="files-only"; shift ;;
+        --workflows)     MODE="workflows"; shift ;;
+        --credentials)   MODE="credentials"; shift ;;
+        --no-mysql)      SKIP_MYSQL=true; shift ;;
+        --no-safety)     SAFETY_BACKUP=false; shift ;;
+        --inspect)       INSPECT_ONLY=true; shift ;;
+        --list)
+            echo ""
+            echo -e "${BLUE}Backups disponibles:${NC}"
+            echo ""
+            if ls "${BACKUP_DIR}/"n8n_*.tar.gz 1>/dev/null 2>&1; then
+                for f in "${BACKUP_DIR}/"n8n_*.tar.gz; do
+                    SIZE=$(du -sh "$f" | cut -f1)
+                    NAME=$(basename "$f")
+                    # Extraer modo y fecha del nombre
+                    echo -e "  ${GREEN}${NAME}${NC}  ($SIZE)"
+                done
+            else
+                echo "  No hay backups disponibles"
+            fi
+            echo ""
+            exit 0
+            ;;
+        -h|--help)       show_help; exit 0 ;;
+        -*)              log_err "Opción desconocida: $1"; show_help; exit 1 ;;
+        *)               BACKUP_FILE="$1"; shift ;;
+    esac
+done
+
+# Validar archivo
+if [[ -z "$BACKUP_FILE" ]]; then
+    log_err "Falta el archivo de backup"
+    show_help
+    exit 1
+fi
+
+# Buscar archivo en varias ubicaciones
+if [[ ! -f "$BACKUP_FILE" ]]; then
+    if [[ -f "${BACKUP_DIR}/${BACKUP_FILE}" ]]; then
+        BACKUP_FILE="${BACKUP_DIR}/${BACKUP_FILE}"
+    else
+        log_err "Archivo no encontrado: $BACKUP_FILE"
+        log_info "Busca backups disponibles con: ./restore.sh --list"
+        exit 1
+    fi
+fi
+
+# =========================================
+# VERIFICAR INTEGRIDAD
+# =========================================
+log_info "Verificando integridad del backup..."
+if ! tar -tzf "$BACKUP_FILE" > /dev/null 2>&1; then
+    log_err "El archivo está corrupto o no es un tar.gz válido"
+    exit 1
+fi
+log_ok "Archivo íntegro"
+
+# Verificar checksum si existe
+CHECKSUM_FILE="${BACKUP_FILE%.tar.gz}.sha256"
+if [[ -f "$CHECKSUM_FILE" ]]; then
+    if sha256sum -c "$CHECKSUM_FILE" --quiet 2>/dev/null; then
+        log_ok "Checksum SHA256 verificado"
+    else
+        log_err "Checksum SHA256 NO coincide — el archivo puede estar dañado"
+        read -p "¿Continuar de todos modos? (s/n): " FORCE
+        if [[ ! "$FORCE" =~ ^[sS]$ ]]; then
+            exit 1
+        fi
+    fi
+else
+    log_warn "No hay checksum (.sha256) para verificar"
+fi
+
+# =========================================
+# MODO INSPECCIÓN
+# =========================================
+if [[ "$INSPECT_ONLY" == true ]]; then
+    echo ""
+    echo -e "${BLUE}═══════════════════════════════════════${NC}"
+    echo -e "${BLUE}  Contenido del backup${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════${NC}"
+    echo ""
+    BK_SIZE=$(du -sh "$BACKUP_FILE" | cut -f1)
+    echo -e "Archivo: $(basename $BACKUP_FILE) ($BK_SIZE)"
+    echo ""
+
+    # Extraer a temporal para inspección
+    TEMP_DIR=$(mktemp -d)
+    tar -xzf "$BACKUP_FILE" -C "$TEMP_DIR"
+    BK_NAME=$(ls "$TEMP_DIR")
+    EXTRACTED="${TEMP_DIR}/${BK_NAME}"
+
+    echo -e "${YELLOW}Componentes encontrados:${NC}"
+    [[ -f "$EXTRACTED/database_postgres.sql" ]] && echo -e "  ${GREEN}✓${NC} PostgreSQL dump ($(du -sh "$EXTRACTED/database_postgres.sql" | cut -f1))" || echo -e "  ${RED}✗${NC} PostgreSQL dump"
+    [[ -f "$EXTRACTED/database_mysql.sql" ]]    && echo -e "  ${GREEN}✓${NC} MySQL dump ($(du -sh "$EXTRACTED/database_mysql.sql" | cut -f1))"    || echo -e "  ${RED}✗${NC} MySQL dump"
+    [[ -d "$EXTRACTED/n8n-data" ]]              && echo -e "  ${GREEN}✓${NC} n8n-data ($(du -sh "$EXTRACTED/n8n-data" | cut -f1))"               || echo -e "  ${RED}✗${NC} n8n-data"
+    [[ -f "$EXTRACTED/docker-compose.yml" ]]    && echo -e "  ${GREEN}✓${NC} docker-compose.yml"                                                 || echo -e "  ${RED}✗${NC} docker-compose.yml"
+    [[ -f "$EXTRACTED/.env" ]]                  && echo -e "  ${GREEN}✓${NC} .env"                                                               || echo -e "  ${RED}✗${NC} .env"
+    [[ -f "$EXTRACTED/json/workflows.json" ]]   && echo -e "  ${GREEN}✓${NC} Workflows JSON"                                                    || echo -e "  ${RED}✗${NC} Workflows JSON"
+    [[ -f "$EXTRACTED/json/credentials.json" ]] && echo -e "  ${GREEN}✓${NC} Credenciales JSON"                                                 || echo -e "  ${RED}✗${NC} Credenciales JSON"
+    [[ -f "$EXTRACTED/json/encryption_key.txt" ]] && echo -e "  ${GREEN}✓${NC} Encryption key"                                                  || echo -e "  ${RED}✗${NC} Encryption key"
+
+    # Contar workflows y credenciales si hay JSON
+    if [[ -f "$EXTRACTED/json/workflows.json" ]]; then
+        WF_COUNT=$(python3 -c "import json; print(len(json.load(open('$EXTRACTED/json/workflows.json'))))" 2>/dev/null || echo "?")
+        echo -e "\n  Workflows: $WF_COUNT"
+    fi
+    if [[ -f "$EXTRACTED/json/credentials.json" ]]; then
+        CR_COUNT=$(python3 -c "import json; print(len(json.load(open('$EXTRACTED/json/credentials.json'))))" 2>/dev/null || echo "?")
+        echo -e "  Credenciales: $CR_COUNT"
+    fi
+
+    rm -rf "$TEMP_DIR"
+    echo ""
+    exit 0
+fi
+
+# =========================================
+# CONFIRMAR RESTORE
+# =========================================
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════${NC}"
+echo -e "${BLUE}  Restore n8n - Modo: ${MODE}${NC}"
+echo -e "${BLUE}═══════════════════════════════════════${NC}"
+echo ""
+
+BK_SIZE=$(du -sh "$BACKUP_FILE" | cut -f1)
+log_info "Archivo: $(basename $BACKUP_FILE) ($BK_SIZE)"
+echo ""
+
+echo -e "${RED}⚠️  ADVERTENCIA: Este proceso puede sobrescribir datos actuales${NC}"
+echo -e "${YELLOW}Modo: $MODE${NC}"
+read -p "¿Deseas continuar? (escribe 'si' para confirmar): " CONFIRM
+
+if [[ "$CONFIRM" != "si" ]]; then
+    log_warn "Restore cancelado"
+    exit 0
+fi
+
+# =========================================
+# BACKUP DE SEGURIDAD PREVIO
+# =========================================
+SAFETY_NAME=""
+if [[ "$SAFETY_BACKUP" == true ]]; then
+    log_info "Creando backup de seguridad del estado actual..."
+    SAFETY_NAME="n8n_pre_restore_$(date +%Y%m%d_%H%M%S)"
+    SAFETY_DIR="${BACKUP_DIR}/${SAFETY_NAME}"
+    mkdir -p "$SAFETY_DIR"
+
+    docker exec n8n-postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$SAFETY_DIR/database_postgres.sql" 2>/dev/null || true
+    cp -r "${N8N_DIR}/n8n-data" "$SAFETY_DIR/" 2>/dev/null || true
+    cp "${N8N_DIR}/.env" "$SAFETY_DIR/" 2>/dev/null || true
+    cp "${N8N_DIR}/docker-compose.yml" "$SAFETY_DIR/" 2>/dev/null || true
+
+    cd "$BACKUP_DIR"
+    tar -czf "${SAFETY_NAME}.tar.gz" "${SAFETY_NAME}" 2>/dev/null
+    rm -rf "$SAFETY_DIR"
+
+    log_ok "Backup de seguridad: ${SAFETY_NAME}.tar.gz"
+    echo -e "  ${YELLOW}Si algo falla: ./restore.sh --no-safety ${SAFETY_NAME}.tar.gz${NC}"
+    echo ""
+fi
+
+# =========================================
+# EXTRAER BACKUP
+# =========================================
+TEMP_DIR=$(mktemp -d)
+log_info "Extrayendo backup..."
+tar -xzf "$BACKUP_FILE" -C "$TEMP_DIR"
+BACKUP_NAME=$(ls "$TEMP_DIR")
+EXTRACTED="${TEMP_DIR}/${BACKUP_NAME}"
+
+# =========================================
+# FUNCIONES DE RESTORE
+# =========================================
+
+wait_for_postgres() {
+    log_info "Esperando a que PostgreSQL esté listo..."
+    for i in {1..30}; do
+        if docker exec n8n-postgres pg_isready -U "$POSTGRES_USER" > /dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    log_warn "PostgreSQL tardó más de lo esperado"
+    return 1
+}
+
+wait_for_mysql() {
+    log_info "Esperando a que MySQL esté listo..."
+    for i in {1..30}; do
+        if docker exec n8n-mysql mysqladmin ping -h localhost -u root -p"$MYSQL_ROOT_PASSWORD" --silent > /dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    log_warn "MySQL tardó más de lo esperado"
+    return 1
+}
+
+restore_postgres() {
+    if [[ ! -f "$EXTRACTED/database_postgres.sql" ]]; then
+        log_warn "No hay dump de PostgreSQL en el backup"
+        return 0
+    fi
+    log_info "Restaurando PostgreSQL..."
+    cd "$N8N_DIR"
+
+    docker compose up -d postgres
+    wait_for_postgres
+
+    # Limpiar y restaurar
+    docker exec n8n-postgres psql -U "$POSTGRES_USER" -d postgres \
+        -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${POSTGRES_DB}' AND pid <> pg_backend_pid();" 2>/dev/null
+    docker exec n8n-postgres psql -U "$POSTGRES_USER" -d postgres \
+        -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};" 2>/dev/null
+    docker exec n8n-postgres psql -U "$POSTGRES_USER" -d postgres \
+        -c "CREATE DATABASE ${POSTGRES_DB};" 2>/dev/null
+    
+    if cat "$EXTRACTED/database_postgres.sql" | docker exec -i n8n-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
+        log_ok "PostgreSQL restaurado"
+    else
+        log_err "Error al restaurar PostgreSQL"
+        return 1
+    fi
+}
+
+restore_mysql() {
+    if [[ "$SKIP_MYSQL" == true ]]; then
+        log_warn "MySQL omitido"
+        return 0
+    fi
+    if [[ ! -f "$EXTRACTED/database_mysql.sql" ]]; then
+        log_warn "No hay dump de MySQL en el backup"
+        return 0
+    fi
+    log_info "Restaurando MySQL..."
+    cd "$N8N_DIR"
+
+    docker compose up -d mysql
+    wait_for_mysql
+
+    if cat "$EXTRACTED/database_mysql.sql" | docker exec -i n8n-mysql mysql -u root -p"$MYSQL_ROOT_PASSWORD" 2>/dev/null; then
+        log_ok "MySQL restaurado"
+    else
+        log_err "Error al restaurar MySQL"
+        return 1
+    fi
+}
+
+restore_files() {
+    if [[ ! -d "$EXTRACTED/n8n-data" ]]; then
+        log_warn "No hay directorio n8n-data en el backup"
+        return 0
+    fi
+    log_info "Restaurando archivos de n8n..."
+    rm -rf "${N8N_DIR}/n8n-data"
+    cp -r "$EXTRACTED/n8n-data" "${N8N_DIR}/"
+    log_ok "Archivos restaurados"
+}
+
+restore_encryption_key() {
+    if [[ ! -f "$EXTRACTED/json/encryption_key.txt" ]]; then
+        log_warn "No hay encryption key en el backup"
+        log_warn "Si las credenciales no funcionan, necesitarás la key del servidor original"
+        return 0
+    fi
+    local ENCKEY
+    ENCKEY=$(cat "$EXTRACTED/json/encryption_key.txt")
+    log_info "Inyectando encryption key en docker-compose..."
+
+    if grep -q "N8N_ENCRYPTION_KEY" "${N8N_DIR}/docker-compose.yml"; then
+        sed -i "s|N8N_ENCRYPTION_KEY=.*|N8N_ENCRYPTION_KEY=${ENCKEY}|" "${N8N_DIR}/docker-compose.yml"
+    else
+        sed -i "/N8N_PROXY_HOPS/a\\      - N8N_ENCRYPTION_KEY=${ENCKEY}" "${N8N_DIR}/docker-compose.yml"
+    fi
+    log_ok "Encryption key inyectada en docker-compose.yml"
+}
+
+import_workflows() {
+    if [[ ! -f "$EXTRACTED/json/workflows.json" ]]; then
+        log_warn "No hay workflows JSON en el backup"
+        return 0
+    fi
+    log_info "Importando workflows..."
+    docker cp "$EXTRACTED/json/workflows.json" n8n:/home/node/.n8n/workflows-import.json
+    if docker exec n8n n8n import:workflow --input=/home/node/.n8n/workflows-import.json 2>/dev/null; then
+        docker exec n8n rm -f /home/node/.n8n/workflows-import.json
+        log_ok "Workflows importados"
+    else
+        log_err "Error al importar workflows"
+        return 1
+    fi
+}
+
+import_credentials() {
+    if [[ ! -f "$EXTRACTED/json/credentials.json" ]]; then
+        log_warn "No hay credenciales JSON en el backup"
+        return 0
+    fi
+    log_info "Importando credenciales..."
+    docker cp "$EXTRACTED/json/credentials.json" n8n:/home/node/.n8n/credentials-import.json
+    if docker exec n8n n8n import:credentials --input=/home/node/.n8n/credentials-import.json 2>/dev/null; then
+        docker exec n8n rm -f /home/node/.n8n/credentials-import.json
+        log_ok "Credenciales importadas"
+    else
+        log_err "Error al importar credenciales"
+        return 1
+    fi
+}
+
+# =========================================
+# EJECUTAR SEGÚN MODO
+# =========================================
+
+cd "$N8N_DIR"
+
+case "$MODE" in
+    full)
+        log_info "Deteniendo contenedores..."
+        docker compose down
+        restore_postgres
+        restore_mysql
+        restore_files
+        log_info "Reiniciando todos los contenedores..."
+        docker compose up -d
+        ;;
+    migrate)
+        log_info "Deteniendo contenedores..."
+        docker compose down
+        restore_postgres
+        restore_mysql
+        restore_files
+        restore_encryption_key
+        log_info "Reiniciando todos los contenedores..."
+        docker compose up -d
+        sleep 15
+        import_workflows
+        import_credentials
+        ;;
+    db-only)
+        log_info "Deteniendo n8n (las BD siguen activas)..."
+        docker compose stop n8n n8n-runner 2>/dev/null || true
+        restore_postgres
+        restore_mysql
+        log_info "Reiniciando n8n..."
+        docker compose up -d
+        ;;
+    files-only)
+        log_info "Deteniendo n8n..."
+        docker compose stop n8n n8n-runner 2>/dev/null || true
+        restore_files
+        log_info "Reiniciando n8n..."
+        docker compose up -d
+        ;;
+    workflows)
+        if ! docker ps --format '{{.Names}}' | grep -q '^n8n$'; then
+            log_err "n8n debe estar corriendo para importar workflows"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
+        import_workflows
+        ;;
+    credentials)
+        if ! docker ps --format '{{.Names}}' | grep -q '^n8n$'; then
+            log_err "n8n debe estar corriendo para importar credenciales"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
+        restore_encryption_key
+        log_warn "Reiniciando n8n para aplicar encryption key..."
+        docker compose restart n8n
+        sleep 10
+        import_credentials
+        ;;
+esac
+
+# =========================================
+# VERIFICACIÓN POST-RESTORE
+# =========================================
+echo ""
+log_info "Verificando estado post-restore..."
+sleep 5
+
+cd "$N8N_DIR"
+HEALTHY=true
+
+for CONTAINER in n8n n8n-postgres; do
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
+        log_ok "$CONTAINER corriendo"
+    else
+        log_err "$CONTAINER NO está corriendo"
+        HEALTHY=false
+    fi
+done
+
+# Verificar que n8n responde
+for i in {1..15}; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5678/healthz 2>/dev/null)
+    if [[ "$HTTP_CODE" == "200" ]]; then
+        log_ok "n8n respondiendo correctamente (HTTP $HTTP_CODE)"
+        break
+    fi
+    if [[ $i -eq 15 ]]; then
+        log_warn "n8n aún no responde (HTTP $HTTP_CODE). Puede necesitar más tiempo."
+    fi
+    sleep 2
+done
+
+# Limpiar
+rm -rf "$TEMP_DIR"
+
+# Resumen
+echo ""
+echo -e "${GREEN}═══════════════════════════════════════${NC}"
+if [[ "$HEALTHY" == true ]]; then
+    echo -e "${GREEN}  ✓ Restore completado exitosamente${NC}"
+else
+    echo -e "${YELLOW}  ⚠ Restore completado con advertencias${NC}"
+fi
+echo -e "${GREEN}═══════════════════════════════════════${NC}"
+echo -e "  Modo:    $MODE"
+echo -e "  Backup:  $(basename $BACKUP_FILE)"
+if [[ -n "$SAFETY_NAME" ]]; then
+    echo -e "  Safety:  ${SAFETY_NAME}.tar.gz"
+fi
+echo ""
+
+if [[ "$HEALTHY" != true ]]; then
+    echo -e "${YELLOW}Revisa los logs:${NC}"
+    echo "  docker compose logs"
+    echo ""
+    if [[ -n "$SAFETY_NAME" ]]; then
+        echo -e "${YELLOW}Para revertir al estado anterior:${NC}"
+        echo "  ./restore.sh --no-safety ${BACKUP_DIR}/${SAFETY_NAME}.tar.gz"
+        echo ""
+    fi
+fi

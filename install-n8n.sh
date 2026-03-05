@@ -543,136 +543,46 @@ HTTPNGINX
 fi
 
 #############################################
-# 13. CREAR SCRIPTS DE BACKUP (MEJORA 9: rutas absolutas)
+# 13. CREAR SCRIPTS DE BACKUP Y RESTORE
 #############################################
-print_message "Creando scripts de backup..."
+print_message "Creando scripts de backup y restore..."
 
-# Script de backup - con rutas absolutas (no $HOME)
-cat > "$N8N_DIR/backup.sh" << BKEOF
-#!/bin/bash
+# Verificar templates
+for TPL in backup.sh.template restore.sh.template; do
+    if [ ! -f "$SCRIPT_DIR/$TPL" ]; then
+        print_error "No se encontró $TPL en $SCRIPT_DIR"
+        exit 1
+    fi
+done
 
-# Script de Backup para n8n
-
-N8N_DIR="$N8N_DIR"
-BACKUP_DIR="$BACKUP_DIR"
-TIMESTAMP=\$(date +%Y%m%d_%H%M%S)
-BACKUP_NAME="n8n_backup_\${TIMESTAMP}"
-
-echo "Iniciando backup de n8n..."
-
-# Crear directorio de backup
-mkdir -p "\${BACKUP_DIR}/\${BACKUP_NAME}"
-
-# Backup de PostgreSQL
-echo "Respaldando base de datos PostgreSQL..."
-docker exec n8n-postgres pg_dump -U $POSTGRES_USER $POSTGRES_DB > "\${BACKUP_DIR}/\${BACKUP_NAME}/database_postgres.sql"
-
-# Backup de MySQL
-echo "Respaldando base de datos MySQL..."
-docker exec n8n-mysql mysqldump -u root -p'$MYSQL_ROOT_PASSWORD' --all-databases > "\${BACKUP_DIR}/\${BACKUP_NAME}/database_mysql.sql"
-
-# Backup de archivos de n8n
-echo "Respaldando archivos de n8n..."
-cp -r "\${N8N_DIR}/n8n-data" "\${BACKUP_DIR}/\${BACKUP_NAME}/"
-
-# Backup de configuración
-cp "\${N8N_DIR}/docker-compose.yml" "\${BACKUP_DIR}/\${BACKUP_NAME}/"
-cp "\${N8N_DIR}/.env" "\${BACKUP_DIR}/\${BACKUP_NAME}/"
-
-# Comprimir backup
-echo "Comprimiendo backup..."
-cd "\$BACKUP_DIR"
-tar -czf "\${BACKUP_NAME}.tar.gz" "\${BACKUP_NAME}"
-rm -rf "\${BACKUP_NAME}"
-
-echo "✓ Backup completado: \${BACKUP_DIR}/\${BACKUP_NAME}.tar.gz"
-
-# Limpiar backups antiguos (mantener últimos 7 días)
-find "\$BACKUP_DIR" -name "n8n_backup_*.tar.gz" -mtime +7 -delete
-echo "✓ Backups antiguos eliminados (>7 días)"
-BKEOF
-
+# Copiar y sustituir placeholders en backup.sh
+cp "$SCRIPT_DIR/backup.sh.template" "$N8N_DIR/backup.sh"
+sed -i "s|__N8N_DIR__|${N8N_DIR}|g" "$N8N_DIR/backup.sh"
+sed -i "s|__BACKUP_DIR__|${BACKUP_DIR}|g" "$N8N_DIR/backup.sh"
+sed -i "s|__POSTGRES_USER__|${POSTGRES_USER}|g" "$N8N_DIR/backup.sh"
+sed -i "s|__POSTGRES_DB__|${POSTGRES_DB}|g" "$N8N_DIR/backup.sh"
+sed -i "s|__MYSQL_ROOT_PASSWORD__|${MYSQL_ROOT_PASSWORD}|g" "$N8N_DIR/backup.sh"
 chmod +x "$N8N_DIR/backup.sh"
 chown "$REAL_USER":"$REAL_USER" "$N8N_DIR/backup.sh"
 
-# Script de restore - con rutas absolutas
-cat > "$N8N_DIR/restore.sh" << RSEOF
-#!/bin/bash
-
-# Script de Restore para n8n
-
-N8N_DIR="$N8N_DIR"
-BACKUP_DIR="$BACKUP_DIR"
-
-if [ -z "\$1" ]; then
-    echo "Uso: ./restore.sh <archivo_backup.tar.gz>"
-    echo "Backups disponibles:"
-    ls -lh "\${BACKUP_DIR}/"*.tar.gz 2>/dev/null || echo "No hay backups disponibles"
-    exit 1
-fi
-
-BACKUP_FILE="\$1"
-
-if [ ! -f "\$BACKUP_FILE" ]; then
-    echo "Error: El archivo \$BACKUP_FILE no existe"
-    exit 1
-fi
-
-echo "⚠️  ADVERTENCIA: Este proceso detendrá n8n y restaurará desde el backup"
-read -p "¿Deseas continuar? (s/n): " CONFIRM
-
-if [[ ! "\$CONFIRM" =~ ^[sS]\$ ]]; then
-    echo "Restore cancelado"
-    exit 0
-fi
-
-# Detener contenedores
-echo "Deteniendo contenedores..."
-cd "\$N8N_DIR"
-docker compose down
-
-# Extraer backup
-TEMP_DIR=\$(mktemp -d)
-echo "Extrayendo backup..."
-tar -xzf "\$BACKUP_FILE" -C "\$TEMP_DIR"
-BACKUP_NAME=\$(ls "\$TEMP_DIR")
-
-# Restaurar PostgreSQL
-echo "Restaurando base de datos PostgreSQL..."
-docker compose up -d postgres
-sleep 10
-cat "\${TEMP_DIR}/\${BACKUP_NAME}/database_postgres.sql" | docker exec -i n8n-postgres psql -U $POSTGRES_USER -d $POSTGRES_DB
-
-# Restaurar MySQL
-echo "Restaurando base de datos MySQL..."
-docker compose up -d mysql
-sleep 10
-cat "\${TEMP_DIR}/\${BACKUP_NAME}/database_mysql.sql" | docker exec -i n8n-mysql mysql -u root -p'$MYSQL_ROOT_PASSWORD'
-
-# Restaurar archivos de n8n
-echo "Restaurando archivos de n8n..."
-rm -rf "\${N8N_DIR}/n8n-data"
-cp -r "\${TEMP_DIR}/\${BACKUP_NAME}/n8n-data" "\${N8N_DIR}/"
-
-# Limpiar
-rm -rf "\$TEMP_DIR"
-
-# Reiniciar contenedores
-echo "Reiniciando contenedores..."
-docker compose up -d
-
-echo "✓ Restore completado exitosamente"
-RSEOF
-
+# Copiar y sustituir placeholders en restore.sh
+cp "$SCRIPT_DIR/restore.sh.template" "$N8N_DIR/restore.sh"
+sed -i "s|__N8N_DIR__|${N8N_DIR}|g" "$N8N_DIR/restore.sh"
+sed -i "s|__BACKUP_DIR__|${BACKUP_DIR}|g" "$N8N_DIR/restore.sh"
+sed -i "s|__POSTGRES_USER__|${POSTGRES_USER}|g" "$N8N_DIR/restore.sh"
+sed -i "s|__POSTGRES_DB__|${POSTGRES_DB}|g" "$N8N_DIR/restore.sh"
+sed -i "s|__MYSQL_ROOT_PASSWORD__|${MYSQL_ROOT_PASSWORD}|g" "$N8N_DIR/restore.sh"
 chmod +x "$N8N_DIR/restore.sh"
 chown "$REAL_USER":"$REAL_USER" "$N8N_DIR/restore.sh"
+
+print_message "backup.sh y restore.sh configurados"
 
 #############################################
 # 14. CONFIGURAR CRON PARA BACKUP AUTOMÁTICO
 #############################################
 print_message "Configurando backup automático diario..."
 
-(crontab -u "$REAL_USER" -l 2>/dev/null; echo "0 2 * * * $N8N_DIR/backup.sh >> $N8N_DIR/backup.log 2>&1") | crontab -u "$REAL_USER" -
+(crontab -u "$REAL_USER" -l 2>/dev/null; echo "0 2 * * * $N8N_DIR/backup.sh --full >> $N8N_DIR/backup.log 2>&1") | crontab -u "$REAL_USER" -
 
 #############################################
 # 15. CONFIGURAR LOGROTATE (MEJORA 10)
@@ -729,10 +639,12 @@ case "\$1" in
         docker compose logs -f n8n
         ;;
     backup)
-        ./backup.sh
+        shift
+        ./backup.sh "\$@"
         ;;
     restore)
-        ./restore.sh "\$2"
+        shift
+        ./restore.sh "\$@"
         ;;
     update)
         echo "Actualizando n8n..."
@@ -741,7 +653,25 @@ case "\$1" in
         echo "✓ n8n actualizado"
         ;;
     *)
-        echo "Uso: \$0 {start|stop|restart|status|logs|backup|restore|update}"
+        echo "Uso: \$0 COMANDO [opciones]"
+        echo ""
+        echo "Comandos:"
+        echo "  start       Iniciar n8n"
+        echo "  stop        Detener n8n"
+        echo "  restart     Reiniciar n8n"
+        echo "  status      Ver estado de contenedores"
+        echo "  logs        Ver logs en tiempo real"
+        echo "  update      Actualizar n8n a última versión"
+        echo "  backup      Crear backup (usa --help para opciones)"
+        echo "  restore     Restaurar backup (usa --help para opciones)"
+        echo ""
+        echo "Ejemplos:"
+        echo "  \$0 backup                        # Backup completo"
+        echo "  \$0 backup --migrate              # Backup para migración"
+        echo "  \$0 backup --dry-run              # Simular backup"
+        echo "  \$0 restore --list                # Listar backups"
+        echo "  \$0 restore archivo.tar.gz        # Restaurar backup"
+        echo "  \$0 restore --migrate archivo.tar.gz  # Restaurar migración"
         exit 1
         ;;
 esac
@@ -783,8 +713,15 @@ cd ~/n8n
 
 ### Backups:
 \`\`\`bash
-./n8n-manage.sh backup                      # Crear backup manual
-./n8n-manage.sh restore backup_file.tar.gz  # Restaurar desde backup
+./n8n-manage.sh backup                              # Backup completo
+./n8n-manage.sh backup --migrate                    # Backup para migración (incluye JSON + encryption key)
+./n8n-manage.sh backup --workflows                  # Solo exportar workflows JSON
+./n8n-manage.sh backup --dry-run                    # Simular sin crear archivos
+./n8n-manage.sh restore --list                      # Listar backups disponibles
+./n8n-manage.sh restore --inspect archivo.tar.gz    # Ver contenido de un backup
+./n8n-manage.sh restore archivo.tar.gz              # Restaurar completo
+./n8n-manage.sh restore --migrate archivo.tar.gz    # Restaurar migración desde otro servidor
+./n8n-manage.sh restore --workflows archivo.tar.gz  # Solo importar workflows
 \`\`\`
 
 **Backup automático**: Configurado diariamente a las 2:00 AM

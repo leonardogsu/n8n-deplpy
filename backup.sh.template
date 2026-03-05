@@ -1,0 +1,319 @@
+#!/bin/bash
+
+#############################################
+# Backup de n8n - Completo y Migración
+#############################################
+
+# Colores
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Rutas (inyectadas por install-n8n.sh)
+N8N_DIR="__N8N_DIR__"
+BACKUP_DIR="__BACKUP_DIR__"
+POSTGRES_USER="__POSTGRES_USER__"
+POSTGRES_DB="__POSTGRES_DB__"
+MYSQL_ROOT_PASSWORD="__MYSQL_ROOT_PASSWORD__"
+
+# Funciones
+log_ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
+log_err()  { echo -e "${RED}[✗]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+log_info() { echo -e "${BLUE}[i]${NC} $1"; }
+
+show_help() {
+    echo ""
+    echo "Uso: ./backup.sh [MODO] [OPCIONES]"
+    echo ""
+    echo "Modos:"
+    echo "  --full         Backup completo: BD + archivos + config (por defecto)"
+    echo "  --migrate      Full + workflows/credenciales JSON + encryption key"
+    echo "  --workflows    Solo exportar workflows en JSON"
+    echo "  --credentials  Solo exportar credenciales en JSON"
+    echo ""
+    echo "Opciones:"
+    echo "  --dry-run      Simular sin crear archivos"
+    echo "  --keep DIAS    Días de retención (por defecto: 7)"
+    echo "  --no-mysql     Omitir backup de MySQL"
+    echo "  -h, --help     Mostrar esta ayuda"
+    echo ""
+    echo "Ejemplos:"
+    echo "  ./backup.sh                     # Backup completo"
+    echo "  ./backup.sh --migrate           # Backup para migrar a otro servidor"
+    echo "  ./backup.sh --workflows         # Solo exportar workflows JSON"
+    echo "  ./backup.sh --full --no-mysql   # Completo sin MySQL"
+    echo "  ./backup.sh --full --dry-run    # Simular backup"
+    echo ""
+}
+
+# Defaults
+MODE="full"
+DRY_RUN=false
+KEEP_DAYS=7
+SKIP_MYSQL=false
+
+# Parsear argumentos
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --full)         MODE="full"; shift ;;
+        --migrate)      MODE="migrate"; shift ;;
+        --workflows)    MODE="workflows"; shift ;;
+        --credentials)  MODE="credentials"; shift ;;
+        --dry-run)      DRY_RUN=true; shift ;;
+        --keep)         KEEP_DAYS="$2"; shift 2 ;;
+        --no-mysql)     SKIP_MYSQL=true; shift ;;
+        -h|--help)      show_help; exit 0 ;;
+        *)              log_err "Opción desconocida: $1"; show_help; exit 1 ;;
+    esac
+done
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_NAME="n8n_${MODE}_${TIMESTAMP}"
+
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════${NC}"
+echo -e "${BLUE}  Backup n8n - Modo: ${MODE}${NC}"
+echo -e "${BLUE}═══════════════════════════════════════${NC}"
+echo ""
+
+# =========================================
+# VERIFICACIONES PREVIAS
+# =========================================
+ERRORS=0
+
+if ! docker ps --format '{{.Names}}' | grep -q '^n8n$'; then
+    log_err "Contenedor n8n no está corriendo"
+    ERRORS=$((ERRORS + 1))
+fi
+
+if [[ "$MODE" == "full" || "$MODE" == "migrate" ]]; then
+    if ! docker ps --format '{{.Names}}' | grep -q '^n8n-postgres$'; then
+        log_err "Contenedor n8n-postgres no está corriendo"
+        ERRORS=$((ERRORS + 1))
+    fi
+    if [[ "$SKIP_MYSQL" == false ]] && ! docker ps --format '{{.Names}}' | grep -q '^n8n-mysql$'; then
+        log_warn "Contenedor n8n-mysql no detectado, omitiendo MySQL"
+        SKIP_MYSQL=true
+    fi
+fi
+
+if [[ $ERRORS -gt 0 ]]; then
+    log_err "Hay $ERRORS errores críticos. Corrige antes de hacer backup."
+    exit 1
+fi
+
+# Verificar espacio en disco (mínimo 500MB)
+AVAIL_MB=$(df -m "$BACKUP_DIR" | awk 'NR==2 {print $4}')
+if [[ "$AVAIL_MB" -lt 500 ]]; then
+    log_err "Espacio insuficiente: ${AVAIL_MB}MB disponibles (mínimo 500MB)"
+    exit 1
+fi
+log_ok "Espacio en disco: ${AVAIL_MB}MB disponibles"
+
+if [[ "$DRY_RUN" == true ]]; then
+    log_warn "MODO DRY-RUN: solo simulación, no se crearán archivos"
+    echo ""
+fi
+
+# =========================================
+# DIRECTORIO TEMPORAL
+# =========================================
+WORK_DIR="${BACKUP_DIR}/${BACKUP_NAME}"
+if [[ "$DRY_RUN" == false ]]; then
+    mkdir -p "$WORK_DIR"
+fi
+
+# =========================================
+# FUNCIONES DE BACKUP
+# =========================================
+
+backup_postgres() {
+    log_info "Respaldando PostgreSQL..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_ok "[DRY-RUN] PostgreSQL se respaldaría"
+        return 0
+    fi
+    if docker exec n8n-postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > "$WORK_DIR/database_postgres.sql" 2>/dev/null; then
+        local SIZE=$(du -sh "$WORK_DIR/database_postgres.sql" | cut -f1)
+        log_ok "PostgreSQL respaldado ($SIZE)"
+    else
+        log_err "Error al respaldar PostgreSQL"
+        return 1
+    fi
+}
+
+backup_mysql() {
+    if [[ "$SKIP_MYSQL" == true ]]; then
+        log_warn "MySQL omitido"
+        return 0
+    fi
+    log_info "Respaldando MySQL..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_ok "[DRY-RUN] MySQL se respaldaría"
+        return 0
+    fi
+    if docker exec n8n-mysql mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" --all-databases > "$WORK_DIR/database_mysql.sql" 2>/dev/null; then
+        local SIZE=$(du -sh "$WORK_DIR/database_mysql.sql" | cut -f1)
+        log_ok "MySQL respaldado ($SIZE)"
+    else
+        log_err "Error al respaldar MySQL"
+        return 1
+    fi
+}
+
+backup_files() {
+    log_info "Respaldando archivos de n8n..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_ok "[DRY-RUN] Archivos se respaldarían"
+        return 0
+    fi
+    cp -r "${N8N_DIR}/n8n-data" "$WORK_DIR/"
+    cp "${N8N_DIR}/docker-compose.yml" "$WORK_DIR/" 2>/dev/null || true
+    cp "${N8N_DIR}/.env" "$WORK_DIR/" 2>/dev/null || true
+    local SIZE=$(du -sh "$WORK_DIR/n8n-data" | cut -f1)
+    log_ok "Archivos respaldados ($SIZE)"
+}
+
+export_workflows() {
+    log_info "Exportando workflows en JSON..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_ok "[DRY-RUN] Workflows se exportarían"
+        return 0
+    fi
+    mkdir -p "$WORK_DIR/json"
+    if docker exec n8n n8n export:workflow --all --output=/home/node/.n8n/workflows-export.json 2>/dev/null; then
+        docker cp n8n:/home/node/.n8n/workflows-export.json "$WORK_DIR/json/workflows.json"
+        docker exec n8n rm -f /home/node/.n8n/workflows-export.json
+        local COUNT=$(python3 -c "import json; print(len(json.load(open('$WORK_DIR/json/workflows.json'))))" 2>/dev/null || echo "?")
+        log_ok "Workflows exportados: $COUNT workflows"
+    else
+        log_err "Error al exportar workflows"
+        return 1
+    fi
+}
+
+export_credentials() {
+    log_info "Exportando credenciales en JSON..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_ok "[DRY-RUN] Credenciales se exportarían"
+        return 0
+    fi
+    mkdir -p "$WORK_DIR/json"
+    if docker exec n8n n8n export:credentials --all --output=/home/node/.n8n/credentials-export.json 2>/dev/null; then
+        docker cp n8n:/home/node/.n8n/credentials-export.json "$WORK_DIR/json/credentials.json"
+        docker exec n8n rm -f /home/node/.n8n/credentials-export.json
+        local COUNT=$(python3 -c "import json; print(len(json.load(open('$WORK_DIR/json/credentials.json'))))" 2>/dev/null || echo "?")
+        log_ok "Credenciales exportadas: $COUNT credenciales"
+    else
+        log_err "Error al exportar credenciales"
+        return 1
+    fi
+}
+
+extract_encryption_key() {
+    log_info "Extrayendo encryption key..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log_ok "[DRY-RUN] Encryption key se extraería"
+        return 0
+    fi
+    mkdir -p "$WORK_DIR/json"
+    local ENCKEY
+    ENCKEY=$(docker exec n8n cat /home/node/.n8n/config 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('encryptionKey',''))" 2>/dev/null)
+    if [[ -n "$ENCKEY" ]]; then
+        echo "$ENCKEY" > "$WORK_DIR/json/encryption_key.txt"
+        chmod 600 "$WORK_DIR/json/encryption_key.txt"
+        log_ok "Encryption key extraída"
+    else
+        log_warn "No se pudo extraer la encryption key del config"
+        log_warn "Puede estar en N8N_ENCRYPTION_KEY o en n8n-data"
+    fi
+}
+
+# =========================================
+# EJECUTAR SEGÚN MODO
+# =========================================
+
+case "$MODE" in
+    full)
+        backup_postgres
+        backup_mysql
+        backup_files
+        ;;
+    migrate)
+        backup_postgres
+        backup_mysql
+        backup_files
+        export_workflows
+        export_credentials
+        extract_encryption_key
+        ;;
+    workflows)
+        export_workflows
+        ;;
+    credentials)
+        export_credentials
+        extract_encryption_key
+        ;;
+esac
+
+# =========================================
+# COMPRIMIR Y VERIFICAR
+# =========================================
+
+if [[ "$DRY_RUN" == false ]]; then
+    log_info "Comprimiendo backup..."
+    cd "$BACKUP_DIR"
+    tar -czf "${BACKUP_NAME}.tar.gz" "${BACKUP_NAME}"
+
+    # Verificar integridad
+    if tar -tzf "${BACKUP_NAME}.tar.gz" > /dev/null 2>&1; then
+        log_ok "Integridad del archivo verificada"
+    else
+        log_err "El archivo tar.gz está corrupto"
+        rm -rf "$WORK_DIR"
+        exit 1
+    fi
+
+    rm -rf "$WORK_DIR"
+
+    # Tamaño final
+    FINAL_SIZE=$(du -sh "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz" | cut -f1)
+
+    # Generar checksum
+    sha256sum "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz" > "${BACKUP_DIR}/${BACKUP_NAME}.sha256"
+    log_ok "Checksum SHA256 generado"
+
+    # Limpiar backups antiguos
+    DELETED=$(find "$BACKUP_DIR" -name "n8n_*.tar.gz" -mtime +${KEEP_DAYS} -delete -print | wc -l)
+    find "$BACKUP_DIR" -name "n8n_*.sha256" -mtime +${KEEP_DAYS} -delete 2>/dev/null
+    if [[ "$DELETED" -gt 0 ]]; then
+        log_ok "Eliminados $DELETED backups antiguos (>${KEEP_DAYS} días)"
+    fi
+
+    # Resumen
+    echo ""
+    echo -e "${GREEN}═══════════════════════════════════════${NC}"
+    echo -e "${GREEN}  ✓ Backup completado${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════${NC}"
+    echo -e "  Archivo:    ${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
+    echo -e "  Tamaño:     $FINAL_SIZE"
+    echo -e "  Modo:       $MODE"
+    echo -e "  Checksum:   ${BACKUP_DIR}/${BACKUP_NAME}.sha256"
+    echo -e "  Retención:  ${KEEP_DAYS} días"
+    echo ""
+
+    if [[ "$MODE" == "migrate" ]]; then
+        echo -e "${YELLOW}Para migrar a otro servidor:${NC}"
+        echo "  1. scp ${BACKUP_DIR}/${BACKUP_NAME}.tar.gz usuario@destino:~/n8n/backups/"
+        echo "  2. En destino: ./restore.sh --migrate ${BACKUP_NAME}.tar.gz"
+        echo ""
+    fi
+else
+    echo ""
+    log_warn "DRY-RUN completado. No se crearon archivos."
+    echo ""
+fi
