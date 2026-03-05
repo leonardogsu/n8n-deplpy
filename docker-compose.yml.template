@@ -1,5 +1,5 @@
 services:
-  # Base de datos PostgreSQL (para n8n)
+  # Base de datos PostgreSQL (backend de n8n)
   postgres:
     image: postgres:15-alpine
     container_name: n8n-postgres
@@ -16,25 +16,15 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - n8n-network
 
-  # Redis para caché (opcional, pero útil)
-  redis:
-    image: redis:7-alpine
-    container_name: n8n-redis
-    restart: unless-stopped
-    volumes:
-      - ./redis-data:/data
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - n8n-network
-
-  # MySQL para flujos de n8n
+  # MySQL para flujos/workflows de n8n
   mysql:
     image: mysql:8.0
     container_name: n8n-mysql
@@ -55,6 +45,11 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - n8n-network
 
@@ -72,6 +67,11 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     networks:
       - n8n-network
 
@@ -92,9 +92,9 @@ services:
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
 
       # General
-      - N8N_PROTOCOL=https
+      - N8N_PROTOCOL=${N8N_PROTOCOL}
       - N8N_HOST=${DOMAIN}
-      - WEBHOOK_URL=https://${DOMAIN}/
+      - WEBHOOK_URL=${N8N_PROTOCOL}://${DOMAIN}/
       - GENERIC_TIMEZONE=${TIMEZONE}
       - N8N_METRICS=true
       - N8N_LOG_LEVEL=info
@@ -118,10 +118,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
       mysql:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     networks:
       - n8n-network
 
@@ -136,6 +139,11 @@ services:
       - N8N_RUNNERS_MAX_CONCURRENCY=5
     depends_on:
       - n8n
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - n8n-network
 
